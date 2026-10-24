@@ -1,5 +1,5 @@
 const path = require("node:path");
-const fs = require("node:fs");
+
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const express = require("express");
@@ -36,18 +36,12 @@ if (
 app.disable("x-powered-by");
 
 const isProduction = process.env.NODE_ENV === "production";
-const frontendDist = path.join(__dirname, "..", "frontend", "dist");
-
-// Render terminates HTTPS at its reverse proxy.
+// HTTPS is terminated by Vercel's reverse proxy.
 if (isProduction) {
   app.set("trust proxy", 1);
 
   if (new URL(frontendOrigin).protocol !== "https:") {
     throw new Error("Production FRONTEND_ORIGIN must use HTTPS.");
-  }
-
-  if (!fs.existsSync(path.join(frontendDist, "index.html"))) {
-    throw new Error("Frontend build missing. Build frontend before starting production.");
   }
 }
 
@@ -63,6 +57,32 @@ app.use(
 );
 
 app.use(express.json({ limit: "100kb" }));
+
+// Reuse one connection attempt across concurrent API requests.
+let databasePromise;
+
+function connectDatabase() {
+  if (!databasePromise) {
+    databasePromise = db().catch((error) => {
+      databasePromise = undefined;
+      throw error;
+    });
+  }
+
+  return databasePromise;
+}
+
+app.use("/api", async (req, res, next) => {
+  try {
+    await connectDatabase();
+    next();
+  } catch {
+    res.status(503).json({
+      success: false,
+      message: "Database temporarily unavailable. Please try again.",
+    });
+  }
+});
 
 // Session storage
 const sessionStore = MongoStore.create({
@@ -368,20 +388,7 @@ app.use("/api", (req, res) => {
   });
 });
 
-// Serve the built React application from this same service in production.
-if (isProduction) {
-  app.use(express.static(frontendDist, { index: false }));
-
-  app.get("/{*splat}", (req, res, next) => {
-    // Missing assets must not receive index.html.
-    if (path.extname(req.path) || !req.accepts("html")) {
-      return next();
-    }
-
-    res.set("Cache-Control", "no-cache");
-    res.sendFile(path.join(frontendDist, "index.html"));
-  });
-}
+// Vercel serves the frontend separately through its frontend service.
 
 // Unknown endpoints
 app.use((req, res) => {
@@ -433,13 +440,18 @@ app.use((error, req, res, next) => {
   });
 });
 
-db()
-  .then(() => {
-    app.listen(port, () => {
-      console.log(`Server running on port ${port}`);
+// Vercel invokes the exported app; local development starts a server.
+module.exports = app;
+
+if (!process.env.VERCEL) {
+  connectDatabase()
+    .then(() => {
+      app.listen(port, "0.0.0.0", () => {
+        console.log(`Server running on port ${port}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Database connection failed:", error.name);
+      process.exitCode = 1;
     });
-  })
-  .catch((error) => {
-    console.error("Database connection failed:", error.name);
-    process.exit(1);
-  });
+}
