@@ -1,4 +1,6 @@
-require("dotenv").config();
+const path = require("node:path");
+const fs = require("node:fs");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const express = require("express");
 const cors = require("cors");
@@ -32,6 +34,26 @@ if (
 }
 
 app.disable("x-powered-by");
+
+const isProduction = process.env.NODE_ENV === "production";
+const frontendDist = path.join(__dirname, "..", "frontend", "dist");
+
+// Render terminates HTTPS at its reverse proxy.
+if (isProduction) {
+  app.set("trust proxy", 1);
+
+  if (new URL(frontendOrigin).protocol !== "https:") {
+    throw new Error("Production FRONTEND_ORIGIN must use HTTPS.");
+  }
+
+  if (!fs.existsSync(path.join(frontendDist, "index.html"))) {
+    throw new Error("Frontend build missing. Build frontend before starting production.");
+  }
+}
+
+if (new URL(frontendOrigin).origin !== frontendOrigin) {
+  throw new Error("FRONTEND_ORIGIN must be an exact origin without a trailing slash.");
+}
 
 app.use(
   cors({
@@ -68,7 +90,7 @@ app.use(
   })
 );
 
-app.use("/auth", authRoutes);
+app.use("/api/auth", authRoutes);
 
 // Validate IDs.
 app.param("id", (req, res, next, id) => {
@@ -216,7 +238,7 @@ const validateBlog = (req, res, next) => {
 };
 
 // Public health check
-app.get("/health", (req, res) => {
+app.get("/api/health", (req, res) => {
   res.json({
     success: true,
     message: "Blogify API is running.",
@@ -224,7 +246,7 @@ app.get("/health", (req, res) => {
 });
 
 // Public listing
-app.get("/blogs", async (req, res) => {
+app.get("/api/blogs", async (req, res) => {
   const response = await Blog.find().sort({
     createdAt: -1,
     _id: -1,
@@ -237,7 +259,7 @@ app.get("/blogs", async (req, res) => {
 });
 
 // Public story detail
-app.get("/blogs/:id", async (req, res) => {
+app.get("/api/blogs/:id", async (req, res) => {
   const response = await Blog.findById(req.params.id);
 
   if (!response) {
@@ -255,7 +277,7 @@ app.get("/blogs/:id", async (req, res) => {
 
 // Create: author identity comes from the signed-in account.
 app.post(
-  "/blogs",
+  "/api/blogs",
   requireUser,
   requireTrustedOrigin,
   validateBlog,
@@ -275,7 +297,7 @@ app.post(
 
 // Update: ownership is checked again in the database query.
 app.put(
-  "/blogs/:id",
+  "/api/blogs/:id",
   requireUser,
   requireTrustedOrigin,
   requireOwner,
@@ -314,7 +336,7 @@ app.put(
 
 // Delete: only the owner can delete.
 app.delete(
-  "/blogs/:id",
+  "/api/blogs/:id",
   requireUser,
   requireTrustedOrigin,
   requireOwner,
@@ -337,6 +359,29 @@ app.delete(
     });
   }
 );
+
+// Unknown API endpoints must return JSON, never the frontend HTML.
+app.use("/api", (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "API endpoint not found.",
+  });
+});
+
+// Serve the built React application from this same service in production.
+if (isProduction) {
+  app.use(express.static(frontendDist, { index: false }));
+
+  app.get("/{*splat}", (req, res, next) => {
+    // Missing assets must not receive index.html.
+    if (path.extname(req.path) || !req.accepts("html")) {
+      return next();
+    }
+
+    res.set("Cache-Control", "no-cache");
+    res.sendFile(path.join(frontendDist, "index.html"));
+  });
+}
 
 // Unknown endpoints
 app.use((req, res) => {
